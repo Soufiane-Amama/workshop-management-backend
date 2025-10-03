@@ -43,6 +43,156 @@ function resolveRange({ period = "weekly", now, from, to } = {}) {
 }
 
 // تجميع ملخصات لكل ورشة + إجمالي عام، مع خيار تضمين تفاصيل الطلبيات
+// async function aggregateOrders({
+//   start,
+//   end,
+//   includeOrders = false,
+//   workshopId,
+//   workshopName,
+// } = {}) {
+//   const matchWorkshops = {};
+//   if (workshopId) matchWorkshops._id = new mongoose.Types.ObjectId(workshopId);
+//   if (workshopName) matchWorkshops.name = workshopName;
+
+//   // نحصل على قائمة الورش المستهدفة لضمان ظهور ورش بدون طلبيات أيضا
+//   const baseWorkshops = await Workshop.find(matchWorkshops)
+//     .select("_id name")
+//     .lean();
+
+//   // إن لم توجد ورش مطابقة نرجع ملخصًا فارغًا
+//   if (baseWorkshops.length === 0) {
+//     return {
+//       workshops: [],
+//       totals: {
+//         workshopsCount: 0,
+//         ordersCount: 0,
+//         itemsCount: 0,
+//         totalAmount: 0,
+//         paidAmount: 0,
+//         unpaidAmount: 0,
+//         paidOrdersCount: 0,
+//         unpaidOrdersCount: 0,
+//       },
+//     };
+//   }
+
+//   // بناء بايبلاين التجميع
+//   const pipeline = [
+//     { $match: matchWorkshops },
+//     { $unwind: "$orders" },
+//     {
+//       $match: {
+//         "orders.createdAt": { $gte: start.toDate(), $lte: end.toDate() },
+//       },
+//     },
+//     {
+//       $group: {
+//         _id: "$_id",
+//         name: { $first: "$name" },
+//         ordersCount: { $sum: 1 },
+//         itemsCount: { $sum: "$orders.itemsCount" },
+//         totalAmount: { $sum: "$orders.totalPrice" },
+//         paidAmount: {
+//           $sum: {
+//             $cond: [{ $eq: ["$orders.isPaid", true] }, "$orders.totalPrice", 0],
+//           },
+//         },
+//         unpaidAmount: {
+//           $sum: {
+//             $cond: [{ $eq: ["$orders.isPaid", false] }, "$orders.totalPrice", 0],
+//           },
+//         },
+//         paidOrdersCount: {
+//           $sum: { $cond: [{ $eq: ["$orders.isPaid", true] }, 1, 0] },
+//         },
+//         unpaidOrdersCount: {
+//           $sum: { $cond: [{ $eq: ["$orders.isPaid", false] }, 1, 0] },
+//         },
+//         ...(includeOrders
+//           ? {
+//               orders: {
+//                 $push: {
+//                   orderId: "$orders._id",
+//                   orderName: "$orders.orderName",
+//                   itemsCount: "$orders.itemsCount",
+//                   totalPrice: "$orders.totalPrice",
+//                   isPaid: "$orders.isPaid",
+//                   createdAt: "$orders.createdAt",
+//                   paidAt: "$orders.paidAt",
+//                   notes: "$orders.notes",
+//                 },
+//               },
+//             }
+//           : {}),
+//       },
+//     },
+//   ];
+
+//   const agg = await Workshop.aggregate(pipeline);
+
+//   // دمج نتائج التجميع مع قائمة الورش الأساسية لضمان ظهور ورش بلا طلبيات (قيم صفرية)
+//   const byId = new Map(agg.map((w) => [String(w._id), w]));
+//   const workshops = baseWorkshops.map((w) => {
+//     const found = byId.get(String(w._id));
+//     return (
+//       found || {
+//         _id: w._id,
+//         name: w.name,
+//         ordersCount: 0,
+//         itemsCount: 0,
+//         totalAmount: 0,
+//         paidAmount: 0,
+//         unpaidAmount: 0,
+//         paidOrdersCount: 0,
+//         unpaidOrdersCount: 0,
+//         ...(includeOrders ? { orders: [] } : {}),
+//       }
+//     );
+//   });
+
+//   // إجماليات عامة
+//   const totals = workshops.reduce(
+//     (acc, w) => {
+//       acc.ordersCount += w.ordersCount;
+//       acc.itemsCount += w.itemsCount;
+//       acc.totalAmount += w.totalAmount;
+//       acc.paidAmount += w.paidAmount;
+//       acc.unpaidAmount += w.unpaidAmount;
+//       acc.paidOrdersCount += w.paidOrdersCount;
+//       acc.unpaidOrdersCount += w.unpaidOrdersCount;
+//       return acc;
+//     },
+//     {
+//       workshopsCount: workshops.length,
+//       ordersCount: 0,
+//       itemsCount: 0,
+//       totalAmount: 0,
+//       paidAmount: 0,
+//       unpaidAmount: 0,
+//       paidOrdersCount: 0,
+//       unpaidOrdersCount: 0,
+//     }
+//   );
+
+//   // إعادة تسمية الحقول قبل الإرجاع
+//   return {
+//     workshops: workshops.map((w) => ({
+//       workshopId: w._id,
+//       workshopName: w.name,
+//       ordersCount: w.ordersCount,
+//       itemsCount: w.itemsCount,
+//       totalAmount: w.totalAmount,
+//       paidAmount: w.paidAmount,
+//       unpaidAmount: w.unpaidAmount,
+//       paidOrdersCount: w.paidOrdersCount,
+//       unpaidOrdersCount: w.unpaidOrdersCount,
+//       ...(includeOrders ? { orders: w.orders } : {}),
+//     })),
+//   totals,
+//   };
+// }
+
+// تجميع ملخصات لكل ورشة + إجمالي عام، مع خيار تضمين تفاصيل الطلبيات
 async function aggregateOrders({
   start,
   end,
@@ -230,3 +380,5 @@ exports.generateReport = async ({
     ...data,
   };
 };
+
+module.exports.aggregateOrders = aggregateOrders;
