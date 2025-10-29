@@ -47,6 +47,7 @@ exports.generateWeeklyStructured = async ({ date } = {}) => {
         ordersCount: { $sum: "$ordersCount" },
         totalDebt: { $sum: "$dayDebt" },
         paidAmount: { $sum: "$dayPaid" },
+        note: { $first: "$note" }, 
       },
     },
     {
@@ -61,6 +62,7 @@ exports.generateWeeklyStructured = async ({ date } = {}) => {
         ordersCount: 1,
         totalDebt: 1,
         paidAmount: 1,
+        note: 1, 
       },
     },
   ];
@@ -76,7 +78,8 @@ exports.generateWeeklyStructured = async ({ date } = {}) => {
         date: d.key,
         label: d.label,
         ordersCount: 0,
-        totalAmount: 0, // تمثل الدين اليومي
+        totalAmount: 0,
+        note: "", // ✅ إضافة note
       })),
       weeklyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
     });
@@ -90,11 +93,11 @@ exports.generateWeeklyStructured = async ({ date } = {}) => {
     if (idx >= 0) {
       wk.days[idx].ordersCount += row.ordersCount;
       wk.days[idx].totalAmount += row.totalDebt;
+      wk.days[idx].note = row.note || "";
     }
     wk.weeklyTotals.ordersCount += row.ordersCount;
     wk.weeklyTotals.totalAmount += row.totalDebt;
     wk.weeklyTotals.paidAmount += row.paidAmount;
-    // الدين الأسبوعي سيُحسب لاحقا من الإجمالي
   }
 
   let totals = { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 };
