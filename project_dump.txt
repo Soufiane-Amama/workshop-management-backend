@@ -1,0 +1,2439 @@
+
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\.env.example ===
+MONGO_URI=mongodb+srv://<user>:<pass>@cluster0.xxxxxx.mongodb.net/
+MONGO_DB_NAME=workshopsDB
+PORT=5000
+TIMEZONE=Africa/Algiers # Asia/Aden # Africa/Casablanca
+REPORT_CRON=0 9 * * *
+ALLOW_AUTO_CREATE_WORKSHOPS=false
+
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\package.json ===
+{
+  "name": "workshop-management-backend",
+  "version": "1.0.0",
+  "description": "نظام إدارة الورش والطلبيات مع التقارير التلقائية",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["workshop", "orders", "reports", "mongodb", "express"],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-async-errors": "^3.1.1",
+    "joi": "^17.11.0",
+    "moment": "^2.29.4",
+    "moment-timezone": "^0.5.45",
+    "mongoose": "^7.6.3",
+    "node-cron": "^3.0.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\app.js ===
+// src/app.js
+const express = require("express");
+const cors = require("cors");
+require("express-async-errors");
+
+const workshopRoutes = require("./routes/workshopRoutes");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Health
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, uptime: process.uptime() });
+});
+
+// Routes
+app.use("/api/workshops", workshopRoutes);
+
+// Error handling
+app.use((err, req, res, next) => {
+  console.error(err);
+  res.status(500).json({ success: false, message: "خطأ في السيرفر" });
+});
+
+module.exports = app;
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\config\db.js ===
+// src/config/db.js
+const mongoose = require("mongoose");
+
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGO_URI, {
+      dbName: process.env.MONGO_DB_NAME || "workshopsDB",
+    });
+    console.log("✅ MongoDB Connected");
+  } catch (error) {
+    console.error("❌ MongoDB Error:", error.message);
+    process.exit(1);
+  }
+
+  mongoose.connection.on("connected", () => console.log("🔌 Mongoose connected"));
+  mongoose.connection.on("disconnected", () => console.log("🪫 Mongoose disconnected"));
+  mongoose.connection.on("error", (err) => console.error("⚠️ Mongoose error:", err));
+};
+
+module.exports = connectDB;
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\config\seed.js ===
+// src/config/seed.js
+const Workshop = require("../models/Workshop");
+
+const DEFAULT_WORKSHOPS = [
+  "01- ورشة عدنان",
+  "02- ورشة بلال",
+  "03- ورشة قيس",
+  "04- ورشة زكرياء",
+  "05- ورشة عمي براهيم",
+  "06- ورشة المزابي",
+  "07- ورشة الخير",
+  "08- ورشة أشرف",
+];
+
+async function seedDefaultWorkshops() {
+  try {
+    const count = await Workshop.countDocuments();
+    if (count > 0) {
+      console.log("ℹ️ Seed: Workshops already exist, skipping seeding.");
+      return;
+    }
+    await Promise.all(
+      DEFAULT_WORKSHOPS.map((name) =>
+        Workshop.updateOne({ name }, { $setOnInsert: { name } }, { upsert: true })
+      )
+    );
+    console.log("🌱 Seed: Default workshops inserted.");
+  } catch (err) {
+    console.error("❌ Seed error:", err.message);
+  }
+}
+
+module.exports = seedDefaultWorkshops;
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\controllers\workshopController.js ===
+// src/controllers/workshopController.js
+const Joi = require("joi");
+const mongoose = require("mongoose");
+const moment = require("moment-timezone");
+const Workshop = require("../models/Workshop");
+const WorkshopDaily = require("../models/WorkshopDaily");
+const { success, error } = require("../utils/response");
+const { generateReport } = require("../services/reportService");
+const {
+  generateWeeklyStructured,
+  generateMonthlyStructured,
+  generateYearlyStructured,
+} = require("../services/structuredReportService");
+
+const TZ = process.env.TIMEZONE || "Africa/Algiers";
+
+function resolveDay(dateStr) {
+  const m = dateStr
+    ? moment.tz(dateStr, "YYYY-MM-DD", TZ)
+    : moment.tz(TZ);
+  const start = m.clone().startOf("day");
+  return { dayKey: start.format("YYYY-MM-DD"), day: start.toDate() };
+}
+
+// ——— الورش ———
+exports.createWorkshop = async (req, res) => {
+  const schema = Joi.object({ name: Joi.string().trim().min(2).max(100).required() });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+  const exists = await Workshop.findOne({ name: value.name });
+  if (exists) return error(res, "الورشة موجودة بالفعل", 400);
+  const workshop = await Workshop.create({ name: value.name });
+  return success(res, workshop, "تم إنشاء الورشة");
+};
+
+exports.getWorkshops = async (req, res) => {
+  const { q } = req.query;
+  const filter = q ? { name: { $regex: q, $options: "i" } } : {};
+  const workshops = await Workshop.find(filter).sort({ name: 1 });
+  return success(res, workshops, "قائمة الورش");
+};
+
+exports.getWorkshopById = async (req, res) => {
+  const { workshopId } = req.params;
+  if (!mongoose.isValidObjectId(workshopId)) return error(res, "معرّف غير صالح", 400);
+  const workshop = await Workshop.findById(workshopId);
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+  return success(res, workshop, "تفاصيل الورشة");
+};
+
+exports.updateWorkshop = async (req, res) => {
+  const { workshopId } = req.params;
+  const schema = Joi.object({ name: Joi.string().trim().min(2).max(100).required() });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+  const updated = await Workshop.findByIdAndUpdate(
+    workshopId,
+    { $set: { name: value.name } },
+    { new: true, runValidators: true }
+  );
+  if (!updated) return error(res, "الورشة غير موجودة", 404);
+  return success(res, updated, "تم تحديث الورشة");
+};
+
+// ——— الإدخالات اليومية ———
+
+// إنشاء/تحديث إدخال يومي لورشة عبر workshopId
+// body: { date?: 'YYYY-MM-DD', ordersCount, debt, paid, note? }
+exports.upsertDaily = async (req, res) => {
+  const { workshopId } = req.params;
+  const schema = Joi.object({
+    date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    ordersCount: Joi.number().integer().min(0).required(),
+    debt: Joi.number().min(0).required(),
+    paid: Joi.number().min(0).required(),
+    note: Joi.string().allow("", null).max(500).optional(),
+  });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+
+  const workshop = await Workshop.findById(workshopId);
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+  const { dayKey, day } = resolveDay(value.date);
+
+  const doc = await WorkshopDaily.findOneAndUpdate(
+    { workshop: workshop._id, dayKey },
+    {
+      $set: {
+        workshop: workshop._id,
+        day,
+        dayKey,
+        ordersCount: value.ordersCount,
+        dayDebt: value.debt,
+        dayPaid: value.paid,
+        note: value.note || undefined,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  return success(res, doc, "تم حفظ الإدخال اليومي");
+};
+
+// تعديل إدخال يومي محدد بـ dayKey
+// params: dayKey=YYYY-MM-DD
+exports.updateDaily = async (req, res) => {
+  const { workshopId, dayKey } = req.params;
+  const schema = Joi.object({
+    ordersCount: Joi.number().integer().min(0).optional(),
+    debt: Joi.number().min(0).optional(),
+    paid: Joi.number().min(0).optional(),
+    note: Joi.string().allow("", null).max(500).optional(),
+  });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+
+  const workshop = await Workshop.findById(workshopId);
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+  const update = {};
+  if (value.ordersCount != null) update.ordersCount = value.ordersCount;
+  if (value.debt != null) update.dayDebt = value.debt;
+  if (value.paid != null) update.dayPaid = value.paid;
+  if (value.note != null) update.note = value.note;
+
+  const doc = await WorkshopDaily.findOneAndUpdate(
+    { workshop: workshop._id, dayKey },
+    { $set: update },
+    { new: true }
+  );
+
+  if (!doc) return error(res, "الإدخال اليومي غير موجود", 404);
+  return success(res, doc, "تم تعديل الإدخال اليومي");
+};
+
+// قائمة الإدخالات اليومية لورشة مع فترة
+// query: from=YYYY-MM-DD, to=YYYY-MM-DD
+exports.listDaily = async (req, res) => {
+  const { workshopId } = req.params;
+  const { from, to } = req.query;
+  const workshop = await Workshop.findById(workshopId);
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+  let match = { workshop: workshop._id };
+  if (from || to) {
+    const start = from ? moment.tz(from, "YYYY-MM-DD", TZ).startOf("day").toDate() : undefined;
+    const end = to ? moment.tz(to, "YYYY-MM-DD", TZ).endOf("day").toDate() : undefined;
+    match.day = {};
+    if (start) match.day.$gte = start;
+    if (end) match.day.$lte = end;
+  }
+
+  const docs = await WorkshopDaily.find(match).sort({ day: 1 });
+  return success(res, { workshopId, workshopName: workshop.name, entries: docs }, "الإدخالات اليومية");
+};
+
+// إضافة دفعة فقط لورشة (تاريخ اختياري، اليوم افتراضي)
+// body: { amount, date?, note? }
+exports.addPayment = async (req, res) => {
+  const { workshopId } = req.params;
+  const schema = Joi.object({
+    amount: Joi.number().greater(0).required(),
+    date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    note: Joi.string().allow("", null).max(500).optional(),
+  });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+
+  const workshop = await Workshop.findById(workshopId);
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+  const { dayKey, day } = resolveDay(value.date);
+
+  const doc = await WorkshopDaily.findOneAndUpdate(
+    { workshop: workshop._id, dayKey },
+    {
+      $setOnInsert: { workshop: workshop._id, day, dayKey, ordersCount: 0, dayDebt: 0 },
+      $inc: { dayPaid: value.amount },
+      ...(value.note ? { $set: { note: value.note } } : {}),
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  // إجمالي الدين المتبقي للورشة (جميع الأيام)
+  const sum = await WorkshopDaily.aggregate([
+    { $match: { workshop: workshop._id } },
+    {
+      $group: {
+        _id: null,
+        totalDebt: { $sum: "$dayDebt" },
+        paidAmount: { $sum: "$dayPaid" },
+      },
+    },
+    {
+      $project: {
+        _id: 0,
+        totalDebt: 1,
+        paidAmount: 1,
+        debtAmount: { $max: [{ $subtract: ["$totalDebt", "$paidAmount"] }, 0] },
+      },
+    },
+  ]);
+  const outstanding = sum[0] || { totalDebt: 0, paidAmount: 0, debtAmount: 0 };
+
+  return success(res, { entry: doc, outstanding }, "تم تسجيل الدفعة");
+};
+
+// الديون المتبقية لكل ورشة (اختياري from/to)
+exports.getDebts = async (req, res) => {
+  const { from, to } = req.query;
+
+  const match = {};
+  if (from || to) {
+    match.day = {};
+    if (from) match.day.$gte = moment.tz(from, "YYYY-MM-DD", TZ).startOf("day").toDate();
+    if (to) match.day.$lte = moment.tz(to, "YYYY-MM-DD", TZ).endOf("day").toDate();
+  }
+
+  const pipeline = [
+    { $match: match },
+    {
+      $group: {
+        _id: "$workshop",
+        ordersCount: { $sum: "$ordersCount" },
+        totalDebt: { $sum: "$dayDebt" },
+        paidAmount: { $sum: "$dayPaid" },
+      },
+    },
+    {
+      $addFields: {
+        debtAmount: { $max: [{ $subtract: ["$totalDebt", "$paidAmount"] }, 0] },
+      },
+    },
+    {
+      $lookup: { from: "workshops", localField: "_id", foreignField: "_id", as: "w" },
+    },
+    { $unwind: "$w" },
+    {
+      $project: {
+        _id: 0,
+        workshopId: "$w._id",
+        workshopName: "$w.name",
+        ordersCount: 1,
+        totalDebt: 1,
+        paidAmount: 1,
+        debtAmount: 1,
+      },
+    },
+    { $sort: { workshopName: 1 } },
+  ];
+
+  const rows = await WorkshopDaily.aggregate(pipeline);
+  const totals = rows.reduce(
+    (acc, r) => {
+      acc.ordersCount += r.ordersCount || 0;
+      acc.totalDebt += r.totalDebt || 0;
+      acc.paidAmount += r.paidAmount || 0;
+      acc.debtAmount += r.debtAmount || 0;
+      return acc;
+    },
+    { ordersCount: 0, totalDebt: 0, paidAmount: 0, debtAmount: 0 }
+  );
+
+  return success(res, { debts: rows, totals }, "الديون المتبقية");
+};
+
+// ——— التقارير ———
+exports.getReports = async (req, res) => {
+  const { period = "weekly", from, to } = req.query;
+  const report = await generateReport({ period, from, to });
+  return success(res, report, "تقرير ملخص للفترة");
+};
+
+exports.getWeeklyStructured = async (req, res) => {
+  const { date } = req.query;
+  const data = await generateWeeklyStructured({ date });
+  return success(res, data, "تقرير أسبوعي مفصل (سبت-جمعة)");
+};
+
+exports.getMonthlyStructured = async (req, res) => {
+  const { year, month } = req.query;
+  const data = await generateMonthlyStructured({ year: Number(year), month: Number(month) });
+  return success(res, data, "تقرير شهري مقسّم إلى أسابيع");
+};
+
+exports.getYearlyStructured = async (req, res) => {
+  const { year } = req.query;
+  const data = await generateYearlyStructured({ year: Number(year) });
+  return success(res, data, "تقرير سنوي مقسّم إلى أشهر");
+};
+
+// ——— إدخالات خاصة للبوت باسم الورشة ———
+
+// body: { workshopName, ordersCount, debt, paid, note?, date? }
+exports.botUpsertDailyByWorkshopName = async (req, res) => {
+  const schema = Joi.object({
+    workshopName: Joi.string().trim().min(2).max(100).required(),
+    ordersCount: Joi.number().integer().min(0).required(),
+    debt: Joi.number().min(0).required(),
+    paid: Joi.number().min(0).required(),
+    note: Joi.string().allow("", null).max(500).optional(),
+    date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(), // اليوم افتراضيًا
+    allowAutoCreateWorkshop: Joi.boolean().default(false),
+  });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+
+  let workshop = await Workshop.findOne({ name: value.workshopName });
+  if (!workshop && (value.allowAutoCreateWorkshop || process.env.ALLOW_AUTO_CREATE_WORKSHOPS === "true")) {
+    workshop = await Workshop.create({ name: value.workshopName });
+  }
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+  const { dayKey, day } = resolveDay(value.date);
+
+  const doc = await WorkshopDaily.findOneAndUpdate(
+    { workshop: workshop._id, dayKey },
+    {
+      $set: {
+        workshop: workshop._id,
+        day,
+        dayKey,
+        ordersCount: value.ordersCount,
+        dayDebt: value.debt,
+        dayPaid: value.paid,
+        note: value.note || undefined,
+      },
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  return success(res, { workshopId: workshop.id, daily: doc }, "تم حفظ الإدخال اليومي (بوت)");
+};
+
+// body: { workshopName, amount, note?, date? }
+exports.botAddPaymentByWorkshopName = async (req, res) => {
+  const schema = Joi.object({
+    workshopName: Joi.string().trim().min(2).max(100).required(),
+    amount: Joi.number().greater(0).required(),
+    note: Joi.string().allow("", null).max(500).optional(),
+    date: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  });
+  const { error: vErr, value } = schema.validate(req.body);
+  if (vErr) return error(res, vErr.details[0].message, 400);
+
+  const workshop = await Workshop.findOne({ name: value.workshopName });
+  if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+  const { dayKey, day } = resolveDay(value.date);
+
+  const doc = await WorkshopDaily.findOneAndUpdate(
+    { workshop: workshop._id, dayKey },
+    {
+      $setOnInsert: { workshop: workshop._id, day, dayKey, ordersCount: 0, dayDebt: 0 },
+      $inc: { dayPaid: value.amount },
+      ...(value.note ? { $set: { note: value.note } } : {}),
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  return success(res, { workshopId: workshop.id, daily: doc }, "تم تسجيل الدفعة (بوت)");
+};
+
+
+
+
+// // src/controllers/workshopController.js
+// const Joi = require("joi");
+// const mongoose = require("mongoose");
+// const Workshop = require("../models/Workshop");
+// const { success, error } = require("../utils/response");
+// const { generateReport } = require("../services/reportService");
+// const {
+//   generateWeeklyStructured,
+//   generateMonthlyStructured,
+//   generateYearlyStructured,
+// } = require("../services/structuredReportService");
+
+// // إنشاء ورشة
+// exports.createWorkshop = async (req, res) => {
+//   const schema = Joi.object({ name: Joi.string().trim().min(2).max(100).required() });
+//   const { error: vErr, value } = schema.validate(req.body);
+//   if (vErr) return error(res, vErr.details[0].message, 400);
+//   const exists = await Workshop.findOne({ name: value.name });
+//   if (exists) return error(res, "الورشة موجودة بالفعل", 400);
+//   const workshop = await Workshop.create({ name: value.name });
+//   return success(res, workshop, "تم إنشاء الورشة");
+// };
+
+// // عرض كل الورش
+// exports.getWorkshops = async (req, res) => {
+//   const { q } = req.query;
+//   const filter = q ? { name: { $regex: q, $options: "i" } } : {};
+//   const workshops = await Workshop.find(filter).sort({ name: 1 });
+//   return success(res, workshops, "قائمة الورش");
+// };
+
+// // جلب ورشة
+// exports.getWorkshopById = async (req, res) => {
+//   const { workshopId } = req.params;
+//   if (!mongoose.isValidObjectId(workshopId)) return error(res, "معرّف غير صالح", 400);
+//   const workshop = await Workshop.findById(workshopId);
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+//   return success(res, workshop, "تفاصيل الورشة");
+// };
+
+// // تحديث اسم ورشة
+// exports.updateWorkshop = async (req, res) => {
+//   const { workshopId } = req.params;
+//   const schema = Joi.object({ name: Joi.string().trim().min(2).max(100).required() });
+//   const { error: vErr, value } = schema.validate(req.body);
+//   if (vErr) return error(res, vErr.details[0].message, 400);
+//   const updated = await Workshop.findByIdAndUpdate(
+//     workshopId,
+//     { $set: { name: value.name } },
+//     { new: true, runValidators: true }
+//   );
+//   if (!updated) return error(res, "الورشة غير موجودة", 404);
+//   return success(res, updated, "تم تحديث الورشة");
+// };
+
+// // إضافة طلبية (مع دعم مبلغ مدفوع ابتدائي)
+// exports.addOrder = async (req, res) => {
+//   const { workshopId } = req.params;
+//   const schema = Joi.object({
+//     orderName: Joi.string().trim().max(120).optional(),
+//     itemsCount: Joi.number().integer().min(1).default(1),
+//     totalPrice: Joi.number().min(0).required(),
+//     amountPaid: Joi.number().min(0).optional(),
+//     isPaid: Joi.boolean().optional(), // لأجل التوافق: إذا true ولم تُرسل amountPaid سنسدد كامل المبلغ
+//     createdAt: Joi.date().optional(),
+//     notes: Joi.string().allow("", null).max(500).optional(),
+//   });
+//   const { error: vErr, value } = schema.validate(req.body);
+//   if (vErr) return error(res, vErr.details[0].message, 400);
+
+//   const workshop = await Workshop.findById(workshopId);
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+//   let amountPaid = value.amountPaid ?? 0;
+//   if (value.isPaid === true && value.amountPaid == null) {
+//     amountPaid = value.totalPrice;
+//   }
+//   if (amountPaid > value.totalPrice) amountPaid = value.totalPrice;
+
+//   const payload = {
+//     orderName: value.orderName || "طلبية",
+//     itemsCount: value.itemsCount,
+//     totalPrice: value.totalPrice,
+//     amountPaid,
+//     createdAt: value.createdAt || new Date(),
+//     notes: value.notes || undefined,
+//     payments: amountPaid > 0 ? [{ amount: amountPaid, at: new Date(), note: "دفعة ابتدائية" }] : [],
+//   };
+
+//   workshop.orders.push(payload);
+//   await workshop.save();
+
+//   const newOrder = workshop.orders[workshop.orders.length - 1];
+//   return success(res, { workshop, order: newOrder }, "تمت إضافة الطلبية");
+// };
+
+// // تعديل طلبية (يمكن تعديل totalPrice/amountPaid)
+// exports.updateOrder = async (req, res) => {
+//   const { workshopId, orderId } = req.params;
+//   const schema = Joi.object({
+//     orderName: Joi.string().trim().max(120).optional(),
+//     itemsCount: Joi.number().integer().min(1).optional(),
+//     totalPrice: Joi.number().min(0).optional(),
+//     amountPaid: Joi.number().min(0).optional(),
+//     createdAt: Joi.date().optional(),
+//     notes: Joi.string().allow("", null).max(500).optional(),
+//     // isPaid متروك للتوافق، لا يُخزَّن مباشرة
+//     isPaid: Joi.boolean().optional(),
+//   });
+//   const { error: vErr, value } = schema.validate(req.body);
+//   if (vErr) return error(res, vErr.details[0].message, 400);
+
+//   const workshop = await Workshop.findById(workshopId);
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+//   const order = workshop.orders.id(orderId);
+//   if (!order) return error(res, "الطلبية غير موجودة", 404);
+
+//   // نطبّق التغييرات
+//   if (value.orderName != null) order.orderName = value.orderName;
+//   if (value.itemsCount != null) order.itemsCount = value.itemsCount;
+//   if (value.createdAt != null) order.createdAt = value.createdAt;
+//   if (value.notes != null) order.notes = value.notes;
+//   if (value.totalPrice != null) order.totalPrice = value.totalPrice;
+
+//   // إذا أرسل amountPaid نحدّثه (مع ضبط عدم تجاوزه totalPrice)
+//   if (value.amountPaid != null) {
+//     order.amountPaid = Math.max(0, Math.min(value.amountPaid, order.totalPrice));
+//   } else if (value.isPaid === true) {
+//     // توافق: إذا isPaid=true ولم يرسل amountPaid
+//     order.amountPaid = order.totalPrice;
+//   }
+
+//   await workshop.save();
+//   return success(res, order, "تم تعديل الطلبية");
+// };
+
+// // حذف طلبية
+// exports.deleteOrder = async (req, res) => {
+//   const { workshopId, orderId } = req.params;
+//   const workshop = await Workshop.findById(workshopId);
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+//   const order = workshop.orders.id(orderId);
+//   if (!order) return error(res, "الطلبية غير موجودة", 404);
+//   order.deleteOne();
+//   await workshop.save();
+//   return success(res, { orderId }, "تم حذف الطلبية");
+// };
+
+// // إضافة دفعة جزئية للطلبية
+// // body: { amount: Number (>0), at?: Date, note?: String }
+// exports.addPayment = async (req, res) => {
+//   const { workshopId, orderId } = req.params;
+//   const schema = Joi.object({
+//     amount: Joi.number().greater(0).required(),
+//     at: Joi.date().optional(),
+//     note: Joi.string().allow("", null).max(200).optional(),
+//   });
+//   const { error: vErr, value } = schema.validate(req.body);
+//   if (vErr) return error(res, vErr.details[0].message, 400);
+
+//   const workshop = await Workshop.findById(workshopId);
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+//   const order = workshop.orders.id(orderId);
+//   if (!order) return error(res, "الطلبية غير موجودة", 404);
+
+//   const remaining = Math.max(0, order.totalPrice - order.amountPaid);
+//   if (remaining <= 0) return error(res, "لا يوجد دين متبقٍ على هذه الطلبية", 400);
+
+//   const used = Math.min(remaining, value.amount);
+//   order.amountPaid += used;
+//   order.payments.push({ amount: used, at: value.at || new Date(), note: value.note || "دفعة" });
+
+//   await workshop.save();
+//   return success(res, order, `تم تسجيل دفعة بقيمة ${used}`);
+// };
+
+// // تسديد كامل المتبقي (توافق مع المسار القديم)
+// exports.payOrder = async (req, res) => {
+//   const { workshopId, orderId } = req.params;
+//   const workshop = await Workshop.findById(workshopId);
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+//   const order = workshop.orders.id(orderId);
+//   if (!order) return error(res, "الطلبية غير موجودة", 404);
+
+//   const remaining = Math.max(0, order.totalPrice - order.amountPaid);
+//   if (remaining <= 0) return success(res, order, "الطلبية مدفوعة بالكامل بالفعل");
+
+//   order.amountPaid += remaining;
+//   order.payments.push({ amount: remaining, at: new Date(), note: "تسديد كامل" });
+
+//   await workshop.save();
+//   return success(res, order, "تم تسديد الطلبية بالكامل");
+// };
+
+// // قائمة الطلبيات لورشة (مع paid=true/false بناءً على الدين)
+// exports.listOrdersForWorkshop = async (req, res) => {
+//   const { workshopId } = req.params;
+//   const { paid, from, to } = req.query;
+
+//   const workshop = await Workshop.findById(workshopId).lean();
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+//   let orders = workshop.orders || [];
+
+//   if (from) {
+//     const fromDate = new Date(from);
+//     orders = orders.filter((o) => new Date(o.createdAt) >= fromDate);
+//   }
+//   if (to) {
+//     const toDate = new Date(to);
+//     orders = orders.filter((o) => new Date(o.createdAt) <= toDate);
+//   }
+
+//   if (paid === "true" || paid === "false") {
+//     const wantPaid = paid === "true";
+//     orders = orders.filter((o) => {
+//       const debt = Math.max(0, (o.totalPrice || 0) - (o.amountPaid || 0));
+//       return wantPaid ? debt === 0 : debt > 0;
+//     });
+//   }
+
+//   return success(res, { workshopId, workshopName: workshop.name, orders }, "قائمة الطلبيات");
+// };
+
+// // الديون (طلبات دين فقط عبر كل الورش)
+// exports.getDebts = async (req, res) => {
+//   const { workshopId, workshopName, from, to } = req.query;
+//   const matchWorkshops = {};
+//   if (workshopId) matchWorkshops._id = new mongoose.Types.ObjectId(workshopId);
+//   if (workshopName) matchWorkshops.name = workshopName;
+
+//   const timeMatch = {};
+//   if (from) timeMatch.$gte = new Date(from);
+//   if (to) timeMatch.$lte = new Date(to);
+
+//   const pipeline = [
+//     { $match: matchWorkshops },
+//     { $unwind: "$orders" },
+//     ...(from || to ? [{ $match: { "orders.createdAt": timeMatch } }] : []),
+//     {
+//       $addFields: {
+//         orderDebt: {
+//           $max: [{ $subtract: ["$orders.totalPrice", "$orders.amountPaid"] }, 0],
+//         },
+//       },
+//     },
+//     { $match: { orderDebt: { $gt: 0 } } },
+//     {
+//       $project: {
+//         _id: 0,
+//         workshopId: "$_id",
+//         workshopName: "$name",
+//         orderId: "$orders._id",
+//         orderName: "$orders.orderName",
+//         itemsCount: "$orders.itemsCount",
+//         totalPrice: "$orders.totalPrice",
+//         amountPaid: "$orders.amountPaid",
+//         debt: "$orderDebt",
+//         createdAt: "$orders.createdAt",
+//         notes: "$orders.notes",
+//       },
+//     },
+//     { $sort: { createdAt: -1 } },
+//   ];
+
+//   const debts = await Workshop.aggregate(pipeline);
+//   const totals = debts.reduce(
+//     (acc, d) => {
+//       acc.ordersCount += 1;
+//       acc.itemsCount += d.itemsCount || 0;
+//       acc.totalAmount += d.totalPrice || 0;
+//       acc.paidAmount += d.amountPaid || 0;
+//       acc.debtAmount += d.debt || 0;
+//       return acc;
+//     },
+//     { ordersCount: 0, itemsCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 }
+//   );
+
+//   return success(res, { debts, totals }, "الديون غير المسددة");
+// };
+
+// // التقارير القديمة (ملخص) — محدثة لتستخدم amountPaid
+// exports.getReports = async (req, res) => {
+//   const { period = "weekly", includeOrders, workshopId, workshopName, from, to } = req.query;
+//   const include = includeOrders === "true";
+//   const report = await generateReport({
+//     period,
+//     includeOrders: include,
+//     workshopId,
+//     workshopName,
+//     from,
+//     to,
+//   });
+//   return success(res, report, "تقرير الملخص");
+// };
+
+// // التقارير الجديدة: structured
+// exports.getWeeklyStructured = async (req, res) => {
+//   const { date } = req.query;
+//   const data = await generateWeeklyStructured({ date });
+//   return success(res, data, "تقرير أسبوعي مفصل (سبت-جمعة)");
+// };
+
+// exports.getMonthlyStructured = async (req, res) => {
+//   const { year, month } = req.query;
+//   const data = await generateMonthlyStructured({ year: Number(year), month: Number(month) });
+//   return success(res, data, "تقرير شهري مقسّم إلى أسابيع");
+// };
+
+// exports.getYearlyStructured = async (req, res) => {
+//   const { year } = req.query;
+//   const data = await generateYearlyStructured({ year: Number(year) });
+//   return success(res, data, "تقرير سنوي مقسّم إلى أشهر");
+// };
+
+// // إدخال من البوت عبر اسم الورشة
+// exports.botCreateOrderByWorkshopName = async (req, res) => {
+//   const schema = Joi.object({
+//     workshopName: Joi.string().trim().min(2).max(100).required(),
+//     orderName: Joi.string().trim().max(120).optional(),
+//     itemsCount: Joi.number().integer().min(1).default(1),
+//     totalPrice: Joi.number().min(0).required(),
+//     amountPaid: Joi.number().min(0).optional(),
+//     isPaid: Joi.boolean().optional(),
+//     createdAt: Joi.date().optional(),
+//     notes: Joi.string().allow("", null).max(500).optional(),
+//     allowAutoCreateWorkshop: Joi.boolean().default(false),
+//   });
+//   const { error: vErr, value } = schema.validate(req.body);
+//   if (vErr) return error(res, vErr.details[0].message, 400);
+
+//   let workshop = await Workshop.findOne({ name: value.workshopName });
+//   const allowAutoCreate =
+//     value.allowAutoCreateWorkshop ||
+//     process.env.ALLOW_AUTO_CREATE_WORKSHOPS === "true";
+
+//   if (!workshop && allowAutoCreate) {
+//     workshop = await Workshop.create({ name: value.workshopName });
+//   }
+//   if (!workshop) return error(res, "الورشة غير موجودة", 404);
+
+//   let amountPaid = value.amountPaid ?? 0;
+//   if (value.isPaid === true && value.amountPaid == null) amountPaid = value.totalPrice;
+//   if (amountPaid > value.totalPrice) amountPaid = value.totalPrice;
+
+//   const payload = {
+//     orderName: value.orderName || "طلبية",
+//     itemsCount: value.itemsCount,
+//     totalPrice: value.totalPrice,
+//     amountPaid,
+//     createdAt: value.createdAt || new Date(),
+//     notes: value.notes || undefined,
+//     payments: amountPaid > 0 ? [{ amount: amountPaid, at: new Date(), note: "دفعة ابتدائية" }] : [],
+//   };
+
+//   workshop.orders.push(payload);
+//   await workshop.save();
+
+//   const newOrder = workshop.orders[workshop.orders.length - 1];
+//   return success(res, { workshopId: workshop.id, order: newOrder }, "تمت إضافة الطلبية (بوت)");
+// };
+
+
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\jobs\reportJob.js ===
+// src/jobs/reportJob.js
+const cron = require("node-cron");
+const vars = require("../utils/vars");
+const { generateWeeklyStructured, generateMonthlyStructured, generateYearlyStructured } = require("../services/structuredReportService");
+
+const TIMEZONE = process.env.TIMEZONE || "Africa/Algiers";
+const CRON = process.env.REPORT_CRON || "0 9 * * *";
+
+cron.schedule(
+  CRON,
+  async () => {
+    try {
+      console.log("⏰ Running structured reports job...");
+      const week = await generateWeeklyStructured({});
+      const month = await generateMonthlyStructured({});
+      const year = await generateYearlyStructured({});
+      vars.setVar("structured:weekly", week);
+      vars.setVar("structured:monthly", month);
+      vars.setVar("structured:yearly", year);
+      vars.setVar("lastReportRunAt", new Date().toISOString());
+      console.log("📊 Structured reports updated in memory.");
+    } catch (err) {
+      console.error("❌ Report job error:", err.message);
+    }
+  },
+  { timezone: TIMEZONE }
+);
+
+module.exports = {};
+
+
+
+
+// // src/jobs/reportJob.js
+// const cron = require("node-cron");
+// const { generateReport } = require("../services/reportService");
+// const vars = require("../utils/vars");
+
+// const TIMEZONE = process.env.TIMEZONE || "Africa/Algiers";
+// // 09:00 كل يوم
+// const CRON = process.env.REPORT_CRON || "0 9 * * *";
+
+// cron.schedule(
+//   CRON,
+//   async () => {
+//     try {
+//       console.log("⏰ Running daily report job...");
+//       const periods = ["weekly", "monthly", "yearly"];
+//       for (const p of periods) {
+//         const report = await generateReport({ period: p, includeOrders: false });
+//         vars.setVar(`report:${p}`, report);
+//       }
+//       vars.setVar("lastReportRunAt", new Date().toISOString());
+//       console.log("📊 Reports refreshed and stored in vars.");
+//     } catch (err) {
+//       console.error("❌ Report job error:", err.message);
+//     }
+//   },
+//   { timezone: TIMEZONE }
+// );
+
+// module.exports = {}; // مجرد تفعيل للجدولة عند require
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\models\Workshop.js ===
+// src/models/Workshop.js
+const mongoose = require("mongoose");
+
+const workshopSchema = new mongoose.Schema(
+  {
+    name: { type: String, required: true, unique: true, trim: true },
+  },
+  { timestamps: true }
+);
+
+workshopSchema.index({ name: 1 }, { unique: true });
+
+workshopSchema.set("toJSON", {
+  virtuals: true,
+  versionKey: false,
+  transform: (doc, ret) => {
+    ret.id = ret._id;
+    delete ret._id;
+  },
+});
+
+module.exports = mongoose.model("Workshop", workshopSchema);
+
+
+
+
+
+// // src/models/Workshop.js
+// const mongoose = require("mongoose");
+
+// const paymentSchema = new mongoose.Schema(
+//   {
+//     amount: { type: Number, required: true, min: 0 },
+//     at: { type: Date, default: Date.now },
+//     note: { type: String, trim: true, maxlength: 200 },
+//   },
+//   { _id: false }
+// );
+
+// const orderSchema = new mongoose.Schema(
+//   {
+//     orderName: { type: String, default: "طلبية" },
+//     itemsCount: { type: Number, default: 1, min: 1 },
+//     totalPrice: { type: Number, required: true, min: 0 },
+//     amountPaid: { type: Number, default: 0, min: 0 },
+//     payments: { type: [paymentSchema], default: [] },
+//     createdAt: { type: Date, default: Date.now },
+//     fullyPaidAt: { type: Date, default: null },
+//     notes: { type: String, trim: true, maxlength: 500 },
+//   },
+//   { _id: true, toJSON: { virtuals: true }, toObject: { virtuals: true } }
+// );
+
+// // دين محسوب
+// orderSchema.virtual("debt").get(function () {
+//   const debt = (this.totalPrice || 0) - (this.amountPaid || 0);
+//   return debt > 0 ? debt : 0;
+// });
+
+// // مدفوع بالكامل محسوب
+// orderSchema.virtual("isPaid").get(function () {
+//   return (this.amountPaid || 0) >= (this.totalPrice || 0);
+// });
+
+// // ضبط fullyPaidAt تلقائيًا
+// orderSchema.pre("validate", function (next) {
+//   if (this.amountPaid < 0) this.amountPaid = 0;
+//   if (this.amountPaid > this.totalPrice) this.amountPaid = this.totalPrice;
+
+//   if (this.amountPaid >= this.totalPrice) {
+//     if (!this.fullyPaidAt) this.fullyPaidAt = new Date();
+//   } else {
+//     this.fullyPaidAt = null;
+//   }
+//   next();
+// });
+
+// const workshopSchema = new mongoose.Schema(
+//   {
+//     name: { type: String, required: true, unique: true, trim: true },
+//     orders: [orderSchema],
+//   },
+//   { timestamps: true }
+// );
+
+// workshopSchema.index({ name: 1 }, { unique: true });
+// workshopSchema.index({ "orders.createdAt": 1 });
+// workshopSchema.index({ "orders.totalPrice": 1 });
+// workshopSchema.index({ "orders.amountPaid": 1 });
+
+// workshopSchema.set("toJSON", {
+//   virtuals: true,
+//   versionKey: false,
+//   transform: (doc, ret) => {
+//     ret.id = ret._id;
+//     delete ret._id;
+//     if (ret.orders && Array.isArray(ret.orders)) {
+//       ret.orders = ret.orders.map((o) => {
+//         const { _id, ...rest } = o;
+//         return { id: _id, ...rest };
+//       });
+//     }
+//   },
+// });
+
+// module.exports = mongoose.model("Workshop", workshopSchema);
+
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\models\WorkshopDaily.js ===
+// src/models/WorkshopDaily.js
+const mongoose = require("mongoose");
+
+const workshopDailySchema = new mongoose.Schema(
+  {
+    workshop: { type: mongoose.Schema.Types.ObjectId, ref: "Workshop", required: true },
+    day: { type: Date, required: true },            // بداية اليوم بتوقيت TZ محفوظة كـ Date (UTC)
+    dayKey: { type: String, required: true },       // YYYY-MM-DD (بحسب TZ)
+    ordersCount: { type: Number, default: 0, min: 0 },
+    dayDebt: { type: Number, default: 0, min: 0 },  // الدين المُسجّل لذلك اليوم (إجمالي)
+    dayPaid: { type: Number, default: 0, min: 0 },  // المبلغ المدفوع ذلك اليوم (قد يغطي أديان سابقة)
+    note: { type: String, trim: true, maxlength: 500 },
+  },
+  { timestamps: true }
+);
+
+workshopDailySchema.index({ workshop: 1, dayKey: 1 }, { unique: true });
+workshopDailySchema.index({ day: 1 });
+workshopDailySchema.index({ workshop: 1 });
+
+workshopDailySchema.set("toJSON", {
+  virtuals: true,
+  versionKey: false,
+  transform: (doc, ret) => {
+    ret.id = ret._id;
+    delete ret._id;
+  },
+});
+
+module.exports = mongoose.model("WorkshopDaily", workshopDailySchema, "workshop_dailies");
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\routes\workshopRoutes.js ===
+// src/routes/workshopRoutes.js
+const express = require("express");
+const router = express.Router();
+const ctrl = require("../controllers/workshopController");
+
+// ورش
+router.post("/", ctrl.createWorkshop);
+router.get("/", ctrl.getWorkshops);
+router.get("/:workshopId", ctrl.getWorkshopById);
+router.patch("/:workshopId", ctrl.updateWorkshop);
+
+// إدخالات يومية
+router.post("/:workshopId/daily", ctrl.upsertDaily);
+router.patch("/:workshopId/daily/:dayKey", ctrl.updateDaily);
+router.get("/:workshopId/daily", ctrl.listDaily);
+
+// دفعات للورشة
+router.post("/:workshopId/payments", ctrl.addPayment);
+
+// إدخالات للبوت
+router.post("/bot/daily", ctrl.botUpsertDailyByWorkshopName);
+router.post("/bot/payments", ctrl.botAddPaymentByWorkshopName);
+
+// ديون
+router.get("/_meta/debts", ctrl.getDebts);
+
+// تقارير
+router.get("/_meta/reports", ctrl.getReports); // ملخص عام للفترة
+router.get("/_meta/reports/weekly-structured", ctrl.getWeeklyStructured);
+router.get("/_meta/reports/monthly-structured", ctrl.getMonthlyStructured);
+router.get("/_meta/reports/yearly-structured", ctrl.getYearlyStructured);
+
+module.exports = router;
+
+
+
+
+// // src/routes/workshopRoutes.js
+// const express = require("express");
+// const router = express.Router();
+// const ctrl = require("../controllers/workshopController");
+
+// // ورش
+// router.post("/", ctrl.createWorkshop);
+// router.get("/", ctrl.getWorkshops);
+// router.get("/:workshopId", ctrl.getWorkshopById);
+// router.patch("/:workshopId", ctrl.updateWorkshop);
+
+// // طلبيات
+// router.post("/:workshopId/orders", ctrl.addOrder);
+// router.get("/:workshopId/orders", ctrl.listOrdersForWorkshop);
+// router.patch("/:workshopId/orders/:orderId", ctrl.updateOrder);
+// router.delete("/:workshopId/orders/:orderId", ctrl.deleteOrder);
+
+// // دفعات
+// router.post("/:workshopId/orders/:orderId/payments", ctrl.addPayment); // دفعة جزئية
+// router.patch("/:workshopId/orders/:orderId/pay", ctrl.payOrder); // تسديد كامل المتبقي (توافق)
+
+// // إدخال خاص للبوت
+// router.post("/bot/orders", ctrl.botCreateOrderByWorkshopName);
+
+// // ديون
+// router.get("/_meta/debts", ctrl.getDebts);
+
+// // تقارير
+// router.get("/_meta/reports", ctrl.getReports); // القديم (ملخص)
+// router.get("/_meta/reports/weekly-structured", ctrl.getWeeklyStructured);
+// router.get("/_meta/reports/monthly-structured", ctrl.getMonthlyStructured);
+// router.get("/_meta/reports/yearly-structured", ctrl.getYearlyStructured);
+
+// module.exports = router;
+
+
+
+
+
+
+
+
+
+// // // src/routes/workshopRoutes.js
+// // const express = require("express");
+// // const router = express.Router();
+// // const ctrl = require("../controllers/workshopController");
+
+// // // ورش
+// // router.post("/", ctrl.createWorkshop);
+// // router.get("/", ctrl.getWorkshops);
+// // router.get("/:workshopId", ctrl.getWorkshopById);
+// // router.patch("/:workshopId", ctrl.updateWorkshop);
+
+// // // طلبيات ضمن ورشة
+// // router.post("/:workshopId/orders", ctrl.addOrder);
+// // router.get("/:workshopId/orders", ctrl.listOrdersForWorkshop);
+// // router.patch("/:workshopId/orders/:orderId", ctrl.updateOrder);
+// // router.delete("/:workshopId/orders/:orderId", ctrl.deleteOrder);
+// // router.patch("/:workshopId/orders/:orderId/pay", ctrl.payOrder);
+
+// // // إدخال خاص للبوت باسم الورشة مباشرة
+// // router.post("/bot/orders", ctrl.botCreateOrderByWorkshopName);
+
+// // // الديون
+// // router.get("/_meta/debts", ctrl.getDebts);
+
+// // // تقارير
+// // router.get("/_meta/reports", ctrl.getReports);
+
+// // module.exports = router;
+
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\server.js ===
+// src/server.js
+const dotenv = require("dotenv");
+dotenv.config();
+
+const connectDB = require("./config/db");
+const seedDefaultWorkshops = require("./config/seed");
+const app = require("./app");
+require("./jobs/reportJob");
+
+const PORT = process.env.PORT || 5000;
+
+async function bootstrap() {
+  await connectDB();
+  await seedDefaultWorkshops();
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`⏱️ Timezone: ${process.env.TIMEZONE || "Africa/Algiers"}`);
+  });
+}
+
+bootstrap().catch((err) => {
+  console.error("❌ Fatal:", err);
+  process.exit(1);
+});
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\services\reportService.js ===
+// src/services/reportService.js
+const moment = require("moment-timezone");
+const mongoose = require("mongoose");
+const WorkshopDaily = require("../models/WorkshopDaily");
+
+const TZ = process.env.TIMEZONE || "Africa/Algiers";
+
+function resolveRange({ period = "weekly", now, from, to } = {}) {
+  const current = now ? moment.tz(now, TZ) : moment.tz(TZ);
+  if (from && to) {
+    const start = moment.tz(from, TZ).startOf("day");
+    const end = moment.tz(to, TZ).endOf("day");
+    return { start, end, usedPeriod: "custom" };
+  }
+  if (period === "weekly") {
+    const day = current.day(); // 0 الأحد ... 6 السبت
+    const diffFromSaturday = (day + 1) % 7; // السبت=0
+    const start = current.clone().startOf("day").subtract(diffFromSaturday, "days");
+    const end = start.clone().add(6, "days").endOf("day");
+    return { start, end, usedPeriod: "weekly" };
+  }
+  if (period === "monthly") {
+    const start = current.clone().startOf("month").startOf("day");
+    const end = current.clone().endOf("month").endOf("day");
+    return { start, end, usedPeriod: "monthly" };
+  }
+  if (period === "yearly") {
+    const start = current.clone().startOf("year").startOf("day");
+    const end = current.clone().endOf("year").endOf("day");
+    return { start, end, usedPeriod: "yearly" };
+  }
+  // fallback weekly
+  const day = current.day();
+  const diffFromSaturday = (day + 1) % 7;
+  const start = current.clone().startOf("day").subtract(diffFromSaturday, "days");
+  const end = start.clone().add(6, "days").endOf("day");
+  return { start, end, usedPeriod: "weekly" };
+}
+
+async function generateReport({
+  period = "weekly",
+  now,
+  from,
+  to,
+} = {}) {
+  const { start, end, usedPeriod } = resolveRange({ period, now, from, to });
+
+  const pipeline = [
+    { $match: { day: { $gte: start.toDate(), $lte: end.toDate() } } },
+    {
+      $group: {
+        _id: "$workshop",
+        ordersCount: { $sum: "$ordersCount" },
+        totalDebt: { $sum: "$dayDebt" },
+        paidAmount: { $sum: "$dayPaid" },
+      },
+    },
+    {
+      $addFields: {
+        debtAmount: { $max: [{ $subtract: ["$totalDebt", "$paidAmount"] }, 0] },
+      },
+    },
+    {
+      $lookup: { from: "workshops", localField: "_id", foreignField: "_id", as: "w" },
+    },
+    { $unwind: "$w" },
+    {
+      $project: {
+        _id: 0,
+        workshopId: "$w._id",
+        workshopName: "$w.name",
+        ordersCount: 1,
+        totalDebt: 1,
+        paidAmount: 1,
+        debtAmount: 1,
+      },
+    },
+    { $sort: { workshopName: 1 } },
+  ];
+
+  const rows = await WorkshopDaily.aggregate(pipeline);
+
+  const totals = rows.reduce(
+    (acc, r) => {
+      acc.ordersCount += r.ordersCount || 0;
+      acc.totalDebt += r.totalDebt || 0;
+      acc.paidAmount += r.paidAmount || 0;
+      acc.debtAmount += r.debtAmount || 0;
+      return acc;
+    },
+    { ordersCount: 0, totalDebt: 0, paidAmount: 0, debtAmount: 0 }
+  );
+
+  return {
+    meta: {
+      period: usedPeriod,
+      timezone: TZ,
+      range: { start: start.toISOString(), end: end.toISOString() },
+      generatedAt: moment.tz(TZ).toISOString(),
+    },
+    workshops: rows,
+    totals,
+  };
+}
+
+module.exports = { generateReport, resolveRange };
+
+
+
+
+// // src/services/reportService.js
+// const moment = require("moment-timezone");
+// const mongoose = require("mongoose");
+// const Workshop = require("../models/Workshop");
+
+// const TZ = process.env.TIMEZONE || "Africa/Algiers";
+
+// // احسب بداية الأسبوع (السبت) ونهاية الأسبوع (الجمعة)
+// function getWeeklyRange(now = moment.tz(TZ)) {
+//   const day = now.day(); // 0 الأحد ... 6 السبت
+//   const diffFromSaturday = (day + 1) % 7; // السبت = 0
+//   const start = now.clone().startOf("day").subtract(diffFromSaturday, "days");
+//   const end = start.clone().add(6, "days").endOf("day");
+//   const activeEnd = moment.min(now.clone().endOf("day"), end); // حتى الآن داخل الأسبوع
+//   return { start, end, activeEnd };
+// }
+
+// function getMonthlyRange(now = moment.tz(TZ)) {
+//   const start = now.clone().startOf("month").startOf("day");
+//   const end = now.clone().endOf("month").endOf("day");
+//   const activeEnd = moment.min(now.clone().endOf("day"), end);
+//   return { start, end, activeEnd };
+// }
+
+// function getYearlyRange(now = moment.tz(TZ)) {
+//   const start = now.clone().startOf("year").startOf("day");
+//   const end = now.clone().endOf("year").endOf("day");
+//   const activeEnd = moment.min(now.clone().endOf("day"), end);
+//   return { start, end, activeEnd };
+// }
+
+// function resolveRange({ period = "weekly", now, from, to } = {}) {
+//   const current = now ? moment.tz(now, TZ) : moment.tz(TZ);
+//   if (from && to) {
+//     const start = moment.tz(from, TZ).startOf("day");
+//     const end = moment.tz(to, TZ).endOf("day");
+//     return { start, end, activeEnd: end, period: "custom" };
+//   }
+//   if (period === "weekly") return { ...getWeeklyRange(current), period };
+//   if (period === "monthly") return { ...getMonthlyRange(current), period };
+//   if (period === "yearly") return { ...getYearlyRange(current), period };
+//   return { ...getWeeklyRange(current), period: "weekly" };
+// }
+
+// // تجميع ملخصات لكل ورشة + إجمالي عام، مع خيار تضمين تفاصيل الطلبيات
+// // async function aggregateOrders({
+// //   start,
+// //   end,
+// //   includeOrders = false,
+// //   workshopId,
+// //   workshopName,
+// // } = {}) {
+// //   const matchWorkshops = {};
+// //   if (workshopId) matchWorkshops._id = new mongoose.Types.ObjectId(workshopId);
+// //   if (workshopName) matchWorkshops.name = workshopName;
+
+// //   // نحصل على قائمة الورش المستهدفة لضمان ظهور ورش بدون طلبيات أيضا
+// //   const baseWorkshops = await Workshop.find(matchWorkshops)
+// //     .select("_id name")
+// //     .lean();
+
+// //   // إن لم توجد ورش مطابقة نرجع ملخصًا فارغًا
+// //   if (baseWorkshops.length === 0) {
+// //     return {
+// //       workshops: [],
+// //       totals: {
+// //         workshopsCount: 0,
+// //         ordersCount: 0,
+// //         itemsCount: 0,
+// //         totalAmount: 0,
+// //         paidAmount: 0,
+// //         unpaidAmount: 0,
+// //         paidOrdersCount: 0,
+// //         unpaidOrdersCount: 0,
+// //       },
+// //     };
+// //   }
+
+// //   // بناء بايبلاين التجميع
+// //   const pipeline = [
+// //     { $match: matchWorkshops },
+// //     { $unwind: "$orders" },
+// //     {
+// //       $match: {
+// //         "orders.createdAt": { $gte: start.toDate(), $lte: end.toDate() },
+// //       },
+// //     },
+// //     {
+// //       $group: {
+// //         _id: "$_id",
+// //         name: { $first: "$name" },
+// //         ordersCount: { $sum: 1 },
+// //         itemsCount: { $sum: "$orders.itemsCount" },
+// //         totalAmount: { $sum: "$orders.totalPrice" },
+// //         paidAmount: {
+// //           $sum: {
+// //             $cond: [{ $eq: ["$orders.isPaid", true] }, "$orders.totalPrice", 0],
+// //           },
+// //         },
+// //         unpaidAmount: {
+// //           $sum: {
+// //             $cond: [{ $eq: ["$orders.isPaid", false] }, "$orders.totalPrice", 0],
+// //           },
+// //         },
+// //         paidOrdersCount: {
+// //           $sum: { $cond: [{ $eq: ["$orders.isPaid", true] }, 1, 0] },
+// //         },
+// //         unpaidOrdersCount: {
+// //           $sum: { $cond: [{ $eq: ["$orders.isPaid", false] }, 1, 0] },
+// //         },
+// //         ...(includeOrders
+// //           ? {
+// //               orders: {
+// //                 $push: {
+// //                   orderId: "$orders._id",
+// //                   orderName: "$orders.orderName",
+// //                   itemsCount: "$orders.itemsCount",
+// //                   totalPrice: "$orders.totalPrice",
+// //                   isPaid: "$orders.isPaid",
+// //                   createdAt: "$orders.createdAt",
+// //                   paidAt: "$orders.paidAt",
+// //                   notes: "$orders.notes",
+// //                 },
+// //               },
+// //             }
+// //           : {}),
+// //       },
+// //     },
+// //   ];
+
+// //   const agg = await Workshop.aggregate(pipeline);
+
+// //   // دمج نتائج التجميع مع قائمة الورش الأساسية لضمان ظهور ورش بلا طلبيات (قيم صفرية)
+// //   const byId = new Map(agg.map((w) => [String(w._id), w]));
+// //   const workshops = baseWorkshops.map((w) => {
+// //     const found = byId.get(String(w._id));
+// //     return (
+// //       found || {
+// //         _id: w._id,
+// //         name: w.name,
+// //         ordersCount: 0,
+// //         itemsCount: 0,
+// //         totalAmount: 0,
+// //         paidAmount: 0,
+// //         unpaidAmount: 0,
+// //         paidOrdersCount: 0,
+// //         unpaidOrdersCount: 0,
+// //         ...(includeOrders ? { orders: [] } : {}),
+// //       }
+// //     );
+// //   });
+
+// //   // إجماليات عامة
+// //   const totals = workshops.reduce(
+// //     (acc, w) => {
+// //       acc.ordersCount += w.ordersCount;
+// //       acc.itemsCount += w.itemsCount;
+// //       acc.totalAmount += w.totalAmount;
+// //       acc.paidAmount += w.paidAmount;
+// //       acc.unpaidAmount += w.unpaidAmount;
+// //       acc.paidOrdersCount += w.paidOrdersCount;
+// //       acc.unpaidOrdersCount += w.unpaidOrdersCount;
+// //       return acc;
+// //     },
+// //     {
+// //       workshopsCount: workshops.length,
+// //       ordersCount: 0,
+// //       itemsCount: 0,
+// //       totalAmount: 0,
+// //       paidAmount: 0,
+// //       unpaidAmount: 0,
+// //       paidOrdersCount: 0,
+// //       unpaidOrdersCount: 0,
+// //     }
+// //   );
+
+// //   // إعادة تسمية الحقول قبل الإرجاع
+// //   return {
+// //     workshops: workshops.map((w) => ({
+// //       workshopId: w._id,
+// //       workshopName: w.name,
+// //       ordersCount: w.ordersCount,
+// //       itemsCount: w.itemsCount,
+// //       totalAmount: w.totalAmount,
+// //       paidAmount: w.paidAmount,
+// //       unpaidAmount: w.unpaidAmount,
+// //       paidOrdersCount: w.paidOrdersCount,
+// //       unpaidOrdersCount: w.unpaidOrdersCount,
+// //       ...(includeOrders ? { orders: w.orders } : {}),
+// //     })),
+// //   totals,
+// //   };
+// // }
+
+// // تجميع ملخصات لكل ورشة + إجمالي عام، مع خيار تضمين تفاصيل الطلبيات
+// async function aggregateOrders({
+//   start,
+//   end,
+//   includeOrders = false,
+//   workshopId,
+//   workshopName,
+// } = {}) {
+//   const matchWorkshops = {};
+//   if (workshopId) matchWorkshops._id = new mongoose.Types.ObjectId(workshopId);
+//   if (workshopName) matchWorkshops.name = workshopName;
+
+//   // نحصل على قائمة الورش المستهدفة لضمان ظهور ورش بدون طلبيات أيضا
+//   const baseWorkshops = await Workshop.find(matchWorkshops)
+//     .select("_id name")
+//     .lean();
+
+//   // إن لم توجد ورش مطابقة نرجع ملخصًا فارغًا
+//   if (baseWorkshops.length === 0) {
+//     return {
+//       workshops: [],
+//       totals: {
+//         workshopsCount: 0,
+//         ordersCount: 0,
+//         itemsCount: 0,
+//         totalAmount: 0,
+//         paidAmount: 0,
+//         unpaidAmount: 0,
+//         paidOrdersCount: 0,
+//         unpaidOrdersCount: 0,
+//       },
+//     };
+//   }
+
+//   // بناء بايبلاين التجميع
+//   const pipeline = [
+//     { $match: matchWorkshops },
+//     { $unwind: "$orders" },
+//     {
+//       $match: {
+//         "orders.createdAt": { $gte: start.toDate(), $lte: end.toDate() },
+//       },
+//     },
+//     {
+//       $group: {
+//         _id: "$_id",
+//         name: { $first: "$name" },
+//         ordersCount: { $sum: 1 },
+//         itemsCount: { $sum: "$orders.itemsCount" },
+//         totalAmount: { $sum: "$orders.totalPrice" },
+//         paidAmount: {
+//           $sum: {
+//             $cond: [{ $eq: ["$orders.isPaid", true] }, "$orders.totalPrice", 0],
+//           },
+//         },
+//         unpaidAmount: {
+//           $sum: {
+//             $cond: [{ $eq: ["$orders.isPaid", false] }, "$orders.totalPrice", 0],
+//           },
+//         },
+//         paidOrdersCount: {
+//           $sum: { $cond: [{ $eq: ["$orders.isPaid", true] }, 1, 0] },
+//         },
+//         unpaidOrdersCount: {
+//           $sum: { $cond: [{ $eq: ["$orders.isPaid", false] }, 1, 0] },
+//         },
+//         ...(includeOrders
+//           ? {
+//               orders: {
+//                 $push: {
+//                   orderId: "$orders._id",
+//                   orderName: "$orders.orderName",
+//                   itemsCount: "$orders.itemsCount",
+//                   totalPrice: "$orders.totalPrice",
+//                   isPaid: "$orders.isPaid",
+//                   createdAt: "$orders.createdAt",
+//                   paidAt: "$orders.paidAt",
+//                   notes: "$orders.notes",
+//                 },
+//               },
+//             }
+//           : {}),
+//       },
+//     },
+//   ];
+
+//   const agg = await Workshop.aggregate(pipeline);
+
+//   // دمج نتائج التجميع مع قائمة الورش الأساسية لضمان ظهور ورش بلا طلبيات (قيم صفرية)
+//   const byId = new Map(agg.map((w) => [String(w._id), w]));
+//   const workshops = baseWorkshops.map((w) => {
+//     const found = byId.get(String(w._id));
+//     return (
+//       found || {
+//         _id: w._id,
+//         name: w.name,
+//         ordersCount: 0,
+//         itemsCount: 0,
+//         totalAmount: 0,
+//         paidAmount: 0,
+//         unpaidAmount: 0,
+//         paidOrdersCount: 0,
+//         unpaidOrdersCount: 0,
+//         ...(includeOrders ? { orders: [] } : {}),
+//       }
+//     );
+//   });
+
+//   // إجماليات عامة
+//   const totals = workshops.reduce(
+//     (acc, w) => {
+//       acc.ordersCount += w.ordersCount;
+//       acc.itemsCount += w.itemsCount;
+//       acc.totalAmount += w.totalAmount;
+//       acc.paidAmount += w.paidAmount;
+//       acc.unpaidAmount += w.unpaidAmount;
+//       acc.paidOrdersCount += w.paidOrdersCount;
+//       acc.unpaidOrdersCount += w.unpaidOrdersCount;
+//       return acc;
+//     },
+//     {
+//       workshopsCount: workshops.length,
+//       ordersCount: 0,
+//       itemsCount: 0,
+//       totalAmount: 0,
+//       paidAmount: 0,
+//       unpaidAmount: 0,
+//       paidOrdersCount: 0,
+//       unpaidOrdersCount: 0,
+//     }
+//   );
+
+//   // إعادة تسمية الحقول قبل الإرجاع
+//   return {
+//     workshops: workshops.map((w) => ({
+//       workshopId: w._id,
+//       workshopName: w.name,
+//       ordersCount: w.ordersCount,
+//       itemsCount: w.itemsCount,
+//       totalAmount: w.totalAmount,
+//       paidAmount: w.paidAmount,
+//       unpaidAmount: w.unpaidAmount,
+//       paidOrdersCount: w.paidOrdersCount,
+//       unpaidOrdersCount: w.unpaidOrdersCount,
+//       ...(includeOrders ? { orders: w.orders } : {}),
+//     })),
+//   totals,
+//   };
+// }
+
+// exports.generateReport = async ({
+//   period = "weekly",
+//   includeOrders = false,
+//   workshopId,
+//   workshopName,
+//   now,
+//   from,
+//   to,
+// } = {}) => {
+//   const { start, activeEnd, end, period: usedPeriod } = resolveRange({
+//     period,
+//     now,
+//     from,
+//     to,
+//   });
+
+//   const data = await aggregateOrders({
+//     start,
+//     end: activeEnd,
+//     includeOrders,
+//     workshopId,
+//     workshopName,
+//   });
+
+//   return {
+//     meta: {
+//       period: usedPeriod,
+//       timezone: TZ,
+//       range: {
+//         start: start.toISOString(),
+//         end: end.toISOString(),
+//         activeEnd: activeEnd.toISOString(),
+//       },
+//       generatedAt: moment.tz(TZ).toISOString(),
+//     },
+//     ...data,
+//   };
+// };
+
+// module.exports.aggregateOrders = aggregateOrders;
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\services\structuredReportService.js ===
+// src/services/structuredReportService.js
+const moment = require("moment-timezone");
+const mongoose = require("mongoose");
+const Workshop = require("../models/Workshop");
+const WorkshopDaily = require("../models/WorkshopDaily");
+
+const TZ = process.env.TIMEZONE || "Africa/Algiers";
+const dayNames = ["الأحد","الاثنين","الثلاثاء","الأربعاء","الخميس","الجمعة","السبت"];
+
+async function getBaseWorkshops(filter = {}) {
+  const list = await Workshop.find(filter).select("_id name").lean();
+  return list.map((w) => ({ id: String(w._id), name: w.name }));
+}
+
+function getWeekRange(targetDate) {
+  const now = targetDate ? moment.tz(targetDate, TZ) : moment.tz(TZ);
+  const day = now.day(); // 0=الأحد ... 6=السبت
+  const diffFromSaturday = (day + 1) % 7; // السبت=0
+  const start = now.clone().startOf("day").subtract(diffFromSaturday, "days");
+  const end = start.clone().add(6, "days").endOf("day");
+  return { start, end };
+}
+
+function daysOfWeek(start) {
+  return Array.from({ length: 7 }).map((_, i) => {
+    const d = start.clone().add(i, "days");
+    return {
+      key: d.format("YYYY-MM-DD"),
+      dateISO: d.toISOString(),
+      weekdayIndex: d.day(),
+      weekdayName: dayNames[d.day()],
+      label: `${dayNames[d.day()]} (${d.format("YYYY-MM-DD")})`,
+    };
+  });
+}
+
+exports.generateWeeklyStructured = async ({ date } = {}) => {
+  const { start, end } = getWeekRange(date);
+  const days = daysOfWeek(start);
+  const baseWorkshops = await getBaseWorkshops();
+
+  const pipeline = [
+    { $match: { day: { $gte: start.toDate(), $lte: end.toDate() } } },
+    {
+      $group: {
+        _id: { wid: "$workshop", dayKey: "$dayKey" },
+        ordersCount: { $sum: "$ordersCount" },
+        totalDebt: { $sum: "$dayDebt" },
+        paidAmount: { $sum: "$dayPaid" },
+      },
+    },
+    {
+      $lookup: { from: "workshops", localField: "_id.wid", foreignField: "_id", as: "w" },
+    },
+    { $unwind: "$w" },
+    {
+      $project: {
+        wid: "$w._id",
+        workshopName: "$w.name",
+        dayKey: "$_id.dayKey",
+        ordersCount: 1,
+        totalDebt: 1,
+        paidAmount: 1,
+      },
+    },
+  ];
+
+  const agg = await WorkshopDaily.aggregate(pipeline);
+
+  const byWorkshop = new Map();
+  for (const w of baseWorkshops) {
+    byWorkshop.set(w.id, {
+      workshopId: w.id,
+      workshopName: w.name,
+      days: days.map((d) => ({
+        date: d.key,
+        label: d.label,
+        ordersCount: 0,
+        totalAmount: 0, // تمثل الدين اليومي
+      })),
+      weeklyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
+    });
+  }
+
+  for (const row of agg) {
+    const wid = String(row.wid);
+    const wk = byWorkshop.get(wid);
+    if (!wk) continue;
+    const idx = wk.days.findIndex((d) => d.date === row.dayKey);
+    if (idx >= 0) {
+      wk.days[idx].ordersCount += row.ordersCount;
+      wk.days[idx].totalAmount += row.totalDebt;
+    }
+    wk.weeklyTotals.ordersCount += row.ordersCount;
+    wk.weeklyTotals.totalAmount += row.totalDebt;
+    wk.weeklyTotals.paidAmount += row.paidAmount;
+    // الدين الأسبوعي سيُحسب لاحقا من الإجمالي
+  }
+
+  let totals = { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 };
+  for (const wk of byWorkshop.values()) {
+    wk.weeklyTotals.debtAmount = Math.max(0, wk.weeklyTotals.totalAmount - wk.weeklyTotals.paidAmount);
+    totals.ordersCount += wk.weeklyTotals.ordersCount;
+    totals.totalAmount += wk.weeklyTotals.totalAmount;
+    totals.paidAmount += wk.weeklyTotals.paidAmount;
+    totals.debtAmount += wk.weeklyTotals.debtAmount;
+  }
+
+  return {
+    meta: {
+      type: "weekly-structured",
+      timezone: TZ,
+      range: { start: start.toISOString(), end: end.toISOString() },
+      days: days.map((d) => ({ date: d.key, label: d.label })),
+    },
+    workshops: Array.from(byWorkshop.values()),
+    totals,
+  };
+};
+
+exports.generateMonthlyStructured = async ({ year, month } = {}) => {
+  const ref = moment.tz(
+    `${year || moment.tz(TZ).year()}-${month || moment.tz(TZ).month() + 1}-01`,
+    "YYYY-M-D",
+    TZ
+  );
+  const start = ref.clone().startOf("month").startOf("day");
+  const end = ref.clone().endOf("month").endOf("day");
+
+  const baseWorkshops = await getBaseWorkshops();
+
+  const pipeline = [
+    { $match: { day: { $gte: start.toDate(), $lte: end.toDate() } } },
+    {
+      $project: {
+        workshop: 1,
+        ordersCount: 1,
+        dayDebt: 1,
+        dayPaid: 1,
+        weekStart: {
+          $dateTrunc: {
+            date: "$day",
+            unit: "week",
+            timezone: TZ,
+            startOfWeek: "saturday",
+          },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: { wid: "$workshop", weekStart: "$weekStart" },
+        ordersCount: { $sum: "$ordersCount" },
+        totalDebt: { $sum: "$dayDebt" },
+        paidAmount: { $sum: "$dayPaid" },
+      },
+    },
+    { $sort: { "_id.weekStart": 1 } },
+    {
+      $lookup: { from: "workshops", localField: "_id.wid", foreignField: "_id", as: "w" },
+    },
+    { $unwind: "$w" },
+  ];
+
+  const agg = await WorkshopDaily.aggregate(pipeline);
+
+  const weekStarts = Array.from(
+    new Set(agg.map((r) => r._id.weekStart.toISOString()))
+  ).sort();
+
+  const arabicWeekNames = ["الأسبوع الأول", "الأسبوع الثاني", "الأسبوع الثالث", "الأسبوع الرابع", "الأسبوع الخامس"];
+
+  const weekIndexByStart = new Map();
+  weekStarts.forEach((iso, idx) => weekIndexByStart.set(iso, idx));
+
+  const byWorkshop = new Map();
+  for (const w of baseWorkshops) {
+    byWorkshop.set(w.id, {
+      workshopId: w.id,
+      workshopName: w.name,
+      weeks: weekStarts.map((iso, idx) => ({
+        label: arabicWeekNames[idx] || `الأسبوع ${idx + 1}`,
+        weekStart: iso,
+        ordersCount: 0,
+        totalAmount: 0,
+        paidAmount: 0,
+        debtAmount: 0,
+      })),
+      monthlyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
+    });
+  }
+
+  for (const row of agg) {
+    const wid = String(row._id.wid);
+    const wk = byWorkshop.get(wid);
+    if (!wk) continue;
+    const iso = row._id.weekStart.toISOString();
+    const idx = weekIndexByStart.get(iso);
+    if (idx != null) {
+      const bucket = wk.weeks[idx];
+      bucket.ordersCount += row.ordersCount;
+      bucket.totalAmount += row.totalDebt;
+      bucket.paidAmount += row.paidAmount;
+    }
+  }
+
+  let totals = { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 };
+  for (const wk of byWorkshop.values()) {
+    wk.monthlyTotals.ordersCount = wk.weeks.reduce((s, b) => s + b.ordersCount, 0);
+    wk.monthlyTotals.totalAmount = wk.weeks.reduce((s, b) => s + b.totalAmount, 0);
+    wk.monthlyTotals.paidAmount = wk.weeks.reduce((s, b) => s + b.paidAmount, 0);
+    wk.monthlyTotals.debtAmount = Math.max(0, wk.monthlyTotals.totalAmount - wk.monthlyTotals.paidAmount);
+
+    totals.ordersCount += wk.monthlyTotals.ordersCount;
+    totals.totalAmount += wk.monthlyTotals.totalAmount;
+    totals.paidAmount += wk.monthlyTotals.paidAmount;
+    totals.debtAmount += wk.monthlyTotals.debtAmount;
+  }
+
+  return {
+    meta: {
+      type: "monthly-structured",
+      timezone: TZ,
+      month: start.format("YYYY-MM"),
+      range: { start: start.toISOString(), end: end.toISOString() },
+      weeks: weekStarts.map((iso, idx) => ({
+        label: arabicWeekNames[idx] || `الأسبوع ${idx + 1}`,
+        weekStart: iso,
+      })),
+    },
+    workshops: Array.from(byWorkshop.values()),
+    totals,
+  };
+};
+
+exports.generateYearlyStructured = async ({ year } = {}) => {
+  const y = year || moment.tz(TZ).year();
+  const start = moment.tz(`${y}-01-01`, "YYYY-MM-DD", TZ).startOf("day");
+  const end = start.clone().endOf("year").endOf("day");
+
+  const baseWorkshops = await getBaseWorkshops();
+
+  const pipeline = [
+    { $match: { day: { $gte: start.toDate(), $lte: end.toDate() } } },
+    {
+      $project: {
+        workshop: 1,
+        ordersCount: 1,
+        dayDebt: 1,
+        dayPaid: 1,
+        ym: {
+          $dateToString: { date: "$day", timezone: TZ, format: "%Y-%m" },
+        },
+      },
+    },
+    {
+      $group: {
+        _id: { wid: "$workshop", ym: "$ym" },
+        ordersCount: { $sum: "$ordersCount" },
+        totalDebt: { $sum: "$dayDebt" },
+        paidAmount: { $sum: "$dayPaid" },
+      },
+    },
+    { $sort: { "_id.ym": 1 } },
+    {
+      $lookup: { from: "workshops", localField: "_id.wid", foreignField: "_id", as: "w" },
+    },
+    { $unwind: "$w" },
+  ];
+
+  const agg = await WorkshopDaily.aggregate(pipeline);
+
+  const months = Array.from({ length: 12 }, (_, i) =>
+    moment.tz(`${y}-${String(i + 1).padStart(2, "0")}-01`, "YYYY-MM-DD", TZ).format("YYYY-MM")
+  );
+  const labels = [
+    "الشهر 01","الشهر 02","الشهر 03","الشهر 04","الشهر 05","الشهر 06",
+    "الشهر 07","الشهر 08","الشهر 09","الشهر 10","الشهر 11","الشهر 12",
+  ];
+  const monthIndexByKey = new Map(months.map((m, idx) => [m, idx]));
+
+  const byWorkshop = new Map();
+  for (const w of await getBaseWorkshops()) {
+    byWorkshop.set(w.id, {
+      workshopId: w.id,
+      workshopName: w.name,
+      months: months.map((m, idx) => ({
+        label: labels[idx],
+        ym: m,
+        ordersCount: 0,
+        totalAmount: 0,
+        paidAmount: 0,
+        debtAmount: 0,
+      })),
+      yearlyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
+    });
+  }
+
+  for (const row of agg) {
+    const wid = String(row._id.wid);
+    const wk = byWorkshop.get(wid);
+    if (!wk) continue;
+    const idx = monthIndexByKey.get(row._id.ym);
+    if (idx != null) {
+      const bucket = wk.months[idx];
+      bucket.ordersCount += row.ordersCount;
+      bucket.totalAmount += row.totalDebt;
+      bucket.paidAmount += row.paidAmount;
+    }
+  }
+
+  let totals = { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 };
+  for (const wk of byWorkshop.values()) {
+    wk.yearlyTotals.ordersCount = wk.months.reduce((s, b) => s + b.ordersCount, 0);
+    wk.yearlyTotals.totalAmount = wk.months.reduce((s, b) => s + b.totalAmount, 0);
+    wk.yearlyTotals.paidAmount = wk.months.reduce((s, b) => s + b.paidAmount, 0);
+    wk.yearlyTotals.debtAmount = Math.max(0, wk.yearlyTotals.totalAmount - wk.yearlyTotals.paidAmount);
+
+    totals.ordersCount += wk.yearlyTotals.ordersCount;
+    totals.totalAmount += wk.yearlyTotals.totalAmount;
+    totals.paidAmount += wk.yearlyTotals.paidAmount;
+    totals.debtAmount += wk.yearlyTotals.debtAmount;
+  }
+
+  return {
+    meta: {
+      type: "yearly-structured",
+      timezone: TZ,
+      year: y,
+      range: { start: start.toISOString(), end: end.toISOString() },
+      months,
+    },
+    workshops: Array.from(byWorkshop.values()),
+    totals,
+  };
+};
+
+
+
+
+
+
+
+
+// // src/services/structuredReportService.js
+// const moment = require("moment-timezone");
+// const mongoose = require("mongoose");
+// const Workshop = require("../models/Workshop");
+
+// const TZ = process.env.TIMEZONE || "Africa/Algiers";
+// const dayNames = ["الأحد", "الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"];
+
+// async function getBaseWorkshops(filter = {}) {
+//   const list = await Workshop.find(filter).select("_id name").lean();
+//   return list.map((w) => ({ id: String(w._id), name: w.name }));
+// }
+
+// function getWeekRange(targetDate) {
+//   const now = targetDate ? moment.tz(targetDate, TZ) : moment.tz(TZ);
+//   const day = now.day(); // 0=الأحد ... 6=السبت
+//   const diffFromSaturday = (day + 1) % 7; // السبت = 0
+//   const start = now.clone().startOf("day").subtract(diffFromSaturday, "days");
+//   const end = start.clone().add(6, "days").endOf("day");
+//   return { start, end };
+// }
+
+// function daysOfWeek(start) {
+//   return Array.from({ length: 7 }).map((_, i) => {
+//     const d = start.clone().add(i, "days");
+//     return {
+//       key: d.format("YYYY-MM-DD"),
+//       dateISO: d.toISOString(),
+//       weekdayIndex: d.day(),
+//       weekdayName: dayNames[d.day()],
+//       label: `${dayNames[d.day()]} (${d.format("YYYY-MM-DD")})`,
+//     };
+//   });
+// }
+
+// function safePaidExpr() {
+//   return { $min: ["$orders.amountPaid", "$orders.totalPrice"] };
+// }
+// function safeDebtExpr() {
+//   return {
+//     $max: [{ $subtract: ["$orders.totalPrice", "$orders.amountPaid"] }, 0],
+//   };
+// }
+
+// // تقرير أسبوعي مفصّل لكل يوم (سبت→جمعة)
+// exports.generateWeeklyStructured = async ({ date } = {}) => {
+//   const { start, end } = getWeekRange(date);
+//   const days = daysOfWeek(start);
+//   const baseWorkshops = await getBaseWorkshops();
+
+//   const pipeline = [
+//     { $unwind: "$orders" },
+//     {
+//       $match: {
+//         "orders.createdAt": { $gte: start.toDate(), $lte: end.toDate() },
+//       },
+//     },
+//     {
+//       $project: {
+//         wid: "$_id",
+//         name: "$name",
+//         dayKey: {
+//           $dateToString: { date: "$orders.createdAt", timezone: TZ, format: "%Y-%m-%d" },
+//         },
+//         price: "$orders.totalPrice",
+//         paid: safePaidExpr(),
+//         debt: safeDebtExpr(),
+//       },
+//     },
+//     {
+//       $group: {
+//         _id: { wid: "$wid", name: "$name", dayKey: "$dayKey" },
+//         ordersCount: { $sum: 1 },
+//         totalAmount: { $sum: "$price" },
+//         paidAmount: { $sum: "$paid" },
+//         debtAmount: { $sum: "$debt" },
+//       },
+//     },
+//   ];
+
+//   const agg = await Workshop.aggregate(pipeline);
+//   const byWorkshop = new Map();
+
+//   // تهيئة بورش وقيم صفرية
+//   for (const w of baseWorkshops) {
+//     byWorkshop.set(w.id, {
+//       workshopId: w.id,
+//       workshopName: w.name,
+//       days: days.map((d) => ({
+//         date: d.key,
+//         label: d.label,
+//         ordersCount: 0,
+//         totalAmount: 0,
+//       })),
+//       weeklyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
+//     });
+//   }
+
+//   // ملء البيانات اليومية
+//   for (const row of agg) {
+//     const wid = String(row._id.wid);
+//     const w = byWorkshop.get(wid);
+//     if (!w) continue;
+//     const dayIdx = w.days.findIndex((d) => d.date === row._id.dayKey);
+//     if (dayIdx >= 0) {
+//       w.days[dayIdx].ordersCount += row.ordersCount;
+//       w.days[dayIdx].totalAmount += row.totalAmount;
+//     }
+//     w.weeklyTotals.ordersCount += row.ordersCount;
+//     w.weeklyTotals.totalAmount += row.totalAmount;
+//     w.weeklyTotals.paidAmount += row.paidAmount;
+//     w.weeklyTotals.debtAmount += row.debtAmount;
+//   }
+
+//   // الإجمالي العام
+//   const totals = Array.from(byWorkshop.values()).reduce(
+//     (acc, w) => {
+//       acc.ordersCount += w.weeklyTotals.ordersCount;
+//       acc.totalAmount += w.weeklyTotals.totalAmount;
+//       acc.paidAmount += w.weeklyTotals.paidAmount;
+//       acc.debtAmount += w.weeklyTotals.debtAmount;
+//       return acc;
+//     },
+//     { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 }
+//   );
+
+//   return {
+//     meta: {
+//       type: "weekly-structured",
+//       timezone: TZ,
+//       range: { start: start.toISOString(), end: end.toISOString() },
+//       days: days.map((d) => ({ date: d.key, label: d.label })),
+//     },
+//     workshops: Array.from(byWorkshop.values()),
+//     totals,
+//   };
+// };
+
+// // تقرير شهري: أسابيع الشهر (سبت→جمعة) لكل ورشة
+// exports.generateMonthlyStructured = async ({ year, month } = {}) => {
+//   const ref = moment.tz(
+//     `${year || moment.tz(TZ).year()}-${month || moment.tz(TZ).month() + 1}-01`,
+//     "YYYY-M-D",
+//     TZ
+//   );
+//   const start = ref.clone().startOf("month").startOf("day");
+//   const end = ref.clone().endOf("month").endOf("day");
+
+//   const baseWorkshops = await getBaseWorkshops();
+
+//   // نحسب weekStart بالسبت باستخدام $dateTrunc
+//   const pipeline = [
+//     { $unwind: "$orders" },
+//     {
+//       $match: {
+//         "orders.createdAt": { $gte: start.toDate(), $lte: end.toDate() },
+//       },
+//     },
+//     {
+//       $project: {
+//         wid: "$_id",
+//         name: "$name",
+//         weekStart: {
+//           $dateTrunc: {
+//             date: "$orders.createdAt",
+//             unit: "week",
+//             timezone: TZ,
+//             startOfWeek: "saturday",
+//           },
+//         },
+//         price: "$orders.totalPrice",
+//         paid: safePaidExpr(),
+//         debt: safeDebtExpr(),
+//       },
+//     },
+//     {
+//       $group: {
+//         _id: { wid: "$wid", name: "$name", weekStart: "$weekStart" },
+//         ordersCount: { $sum: 1 },
+//         totalAmount: { $sum: "$price" },
+//         paidAmount: { $sum: "$paid" },
+//         debtAmount: { $sum: "$debt" },
+//       },
+//     },
+//     { $sort: { "_id.weekStart": 1 } },
+//   ];
+
+//   const agg = await Workshop.aggregate(pipeline);
+
+//   // كل أسابيع الشهر الموجودة في النتائج
+//   const weekStarts = Array.from(
+//     new Set(agg.map((r) => r._id.weekStart.toISOString()))
+//   ).sort();
+
+//   // تحجيم إلى 4 أو 5 أسابيع بحسب الشهر
+//   const arabicWeekNames = ["الأسبوع الأول", "الأسبوع الثاني", "الأسبوع الثالث", "الأسبوع الرابع", "الأسبوع الخامس"];
+
+//   const weekIndexByStart = new Map();
+//   weekStarts.forEach((iso, idx) => weekIndexByStart.set(iso, idx));
+
+//   const byWorkshop = new Map();
+//   for (const w of baseWorkshops) {
+//     byWorkshop.set(w.id, {
+//       workshopId: w.id,
+//       workshopName: w.name,
+//       weeks: weekStarts.map((iso, idx) => ({
+//         label: arabicWeekNames[idx] || `الأسبوع ${idx + 1}`,
+//         weekStart: iso,
+//         ordersCount: 0,
+//         totalAmount: 0,
+//         paidAmount: 0,
+//         debtAmount: 0,
+//       })),
+//       monthlyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
+//     });
+//   }
+
+//   for (const row of agg) {
+//     const wid = String(row._id.wid);
+//     const w = byWorkshop.get(wid);
+//     if (!w) continue;
+//     const iso = row._id.weekStart.toISOString();
+//     const idx = weekIndexByStart.get(iso);
+//     if (idx != null) {
+//       const bucket = w.weeks[idx];
+//       bucket.ordersCount += row.ordersCount;
+//       bucket.totalAmount += row.totalAmount;
+//       bucket.paidAmount += row.paidAmount;
+//       bucket.debtAmount += row.debtAmount;
+//       w.monthlyTotals.ordersCount += row.ordersCount;
+//       w.monthlyTotals.totalAmount += row.totalAmount;
+//       w.monthlyTotals.paidAmount += row.paidAmount;
+//       w.monthlyTotals.debtAmount += row.debtAmount;
+//     }
+//   }
+
+//   const totals = Array.from(byWorkshop.values()).reduce(
+//     (acc, w) => {
+//       acc.ordersCount += w.monthlyTotals.ordersCount;
+//       acc.totalAmount += w.monthlyTotals.totalAmount;
+//       acc.paidAmount += w.monthlyTotals.paidAmount;
+//       acc.debtAmount += w.monthlyTotals.debtAmount;
+//       return acc;
+//     },
+//     { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 }
+//   );
+
+//   return {
+//     meta: {
+//       type: "monthly-structured",
+//       timezone: TZ,
+//       month: start.format("YYYY-MM"),
+//       range: { start: start.toISOString(), end: end.toISOString() },
+//       weeks: weekStarts.map((iso, idx) => ({
+//         label: arabicWeekNames[idx] || `الأسبوع ${idx + 1}`,
+//         weekStart: iso,
+//       })),
+//     },
+//     workshops: Array.from(byWorkshop.values()),
+//     totals,
+//   };
+// };
+
+// // تقرير سنوي: 12 شهرًا لكل ورشة
+// exports.generateYearlyStructured = async ({ year } = {}) => {
+//   const y = year || moment.tz(TZ).year();
+//   const start = moment.tz(`${y}-01-01`, "YYYY-MM-DD", TZ).startOf("day");
+//   const end = start.clone().endOf("year").endOf("day");
+//   const baseWorkshops = await getBaseWorkshops();
+
+//   const pipeline = [
+//     { $unwind: "$orders" },
+//     {
+//       $match: {
+//         "orders.createdAt": { $gte: start.toDate(), $lte: end.toDate() },
+//       },
+//     },
+//     {
+//       $project: {
+//         wid: "$_id",
+//         name: "$name",
+//         ym: {
+//           $dateToString: { date: "$orders.createdAt", timezone: TZ, format: "%Y-MM" },
+//         },
+//         price: "$orders.totalPrice",
+//         paid: safePaidExpr(),
+//         debt: safeDebtExpr(),
+//       },
+//     },
+//     {
+//       $group: {
+//         _id: { wid: "$wid", name: "$name", ym: "$ym" },
+//         ordersCount: { $sum: 1 },
+//         totalAmount: { $sum: "$price" },
+//         paidAmount: { $sum: "$paid" },
+//         debtAmount: { $sum: "$debt" },
+//       },
+//     },
+//     { $sort: { "_id.ym": 1 } },
+//   ];
+
+//   const agg = await Workshop.aggregate(pipeline);
+
+//   // الأشهر 01..12
+//   const months = Array.from({ length: 12 }, (_, i) =>
+//     moment.tz(`${y}-${String(i + 1).padStart(2, "0")}-01`, "YYYY-MM-DD", TZ).format("YYYY-MM")
+//   );
+
+//   const arabicMonthOrderNames = [
+//     "الشهر 01","الشهر 02","الشهر 03","الشهر 04",
+//     "الشهر 05","الشهر 06","الشهر 07","الشهر 08",
+//     "الشهر 09","الشهر 10","الشهر 11","الشهر 12",
+//   ];
+
+//   const monthIndexByKey = new Map(months.map((m, idx) => [m, idx]));
+
+//   const byWorkshop = new Map();
+//   for (const w of baseWorkshops) {
+//     byWorkshop.set(w.id, {
+//       workshopId: w.id,
+//       workshopName: w.name,
+//       months: months.map((m, idx) => ({
+//         label: arabicMonthOrderNames[idx],
+//         ym: m,
+//         ordersCount: 0,
+//         totalAmount: 0,
+//         paidAmount: 0,
+//         debtAmount: 0,
+//       })),
+//       yearlyTotals: { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 },
+//     });
+//   }
+
+//   for (const row of agg) {
+//     const wid = String(row._id.wid);
+//     const w = byWorkshop.get(wid);
+//     if (!w) continue;
+//     const idx = monthIndexByKey.get(row._id.ym);
+//     if (idx != null) {
+//       const bucket = w.months[idx];
+//       bucket.ordersCount += row.ordersCount;
+//       bucket.totalAmount += row.totalAmount;
+//       bucket.paidAmount += row.paidAmount;
+//       bucket.debtAmount += row.debtAmount;
+//       w.yearlyTotals.ordersCount += row.ordersCount;
+//       w.yearlyTotals.totalAmount += row.totalAmount;
+//       w.yearlyTotals.paidAmount += row.paidAmount;
+//       w.yearlyTotals.debtAmount += row.debtAmount;
+//     }
+//   }
+
+//   const totals = Array.from(byWorkshop.values()).reduce(
+//     (acc, w) => {
+//       acc.ordersCount += w.yearlyTotals.ordersCount;
+//       acc.totalAmount += w.yearlyTotals.totalAmount;
+//       acc.paidAmount += w.yearlyTotals.paidAmount;
+//       acc.debtAmount += w.yearlyTotals.debtAmount;
+//       return acc;
+//     },
+//     { ordersCount: 0, totalAmount: 0, paidAmount: 0, debtAmount: 0 }
+//   );
+
+//   return {
+//     meta: {
+//       type: "yearly-structured",
+//       timezone: TZ,
+//       year: y,
+//       range: { start: start.toISOString(), end: end.toISOString() },
+//       months,
+//     },
+//     workshops: Array.from(byWorkshop.values()),
+//     totals,
+//   };
+// };
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\utils\response.js ===
+// src/utils/response.js
+exports.success = (res, data, message = "تم بنجاح") => {
+  return res.status(200).json({ success: true, message, data });
+};
+
+exports.error = (res, message = "حدث خطأ", status = 500, details) => {
+  return res.status(status).json({ success: false, message, details });
+};
+
+=== FILE: C:\Users\HP\Desktop\workshop-management-backend\src\utils\vars.js ===
+// src/utils/vars.js
+const store = new Map();
+
+module.exports = {
+  setVar: (key, value) => store.set(key, value),
+  getVar: (key) => store.get(key),
+  getAll: () => Object.fromEntries(store.entries()),
+};
